@@ -1,0 +1,339 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <LiquidCrystal.h>
+
+MPU6050 mpu;
+LiquidCrystal lcd(8,9,4,5,6,7);
+
+// Variables for stopping logic
+bool isAccelerate = false;  // Track if the car is climbing
+bool isDecelerate = false;  // Flag to stop the car
+bool displayAngle = true;  // Flag to display angle on LCD
+bool Task1 = false;
+
+int16_t ax, ay, az, gx, gy, gz;
+float ax_offset = 0, ay_offset = 0, az_offset = 0;
+float gx_offset = 0, gy_offset = 0, gz_offset = 0;
+float prev_ax = 0, prev_ay = 0, prev_az = 0;
+
+float roll_acc = 0, pitch_acc = 0;
+float roll_gyro = 0, pitch_gyro = 0, yaw_gyro = 0;
+float roll = 0, pitch = 0;
+
+unsigned long prevTime = 0;
+float dt = 0.01;     // Initial delta time
+float alpha = 0.98;  // Complementary filter constant
+
+float degree = 0.3;  // Start angle
+const float MAX_ANGLE = 25.7;  // Maximum simulated angle
+const float ANGLE_STEP = 0.25;  // Increment step for each loop iteration
+
+// Motor pins
+const int ENA = 10;
+const int ENB = 11;
+const int IN1 = A1;
+const int IN2 = A0;
+const int IN3 = 12;
+const int IN4 = 13;
+const int sr = 3;  // IR right sensor
+const int sl = 2;  // IR left sensor
+int svr = 0;
+int svl = 0;
+
+// Thresholds
+const float CLIMB_THRESHOLD   = 3 ;
+const float STOP_THRESHOLD    = 15 ;
+const float DESCENT_THRESHOLD = -10;
+
+
+void calibrateMPU() {
+  const int numSamples = 1000;
+  float ax_sum = 0, ay_sum = 0, az_sum = 0;
+  float gx_sum = 0, gy_sum = 0, gz_sum = 0;
+
+  for (int i = 0; i < numSamples; i++) {
+    mpu.getAcceleration(&ax, &ay, &az);
+    mpu.getRotation(&gx, &gy, &gz);
+
+    ax_sum += ax / 16384.0;
+    ay_sum += ay / 16384.0;
+    az_sum += az / 16384.0 - 1.0;  // Subtract 1g for gravity
+
+    gx_sum += gx / 131.0;
+    gy_sum += gy / 131.0;
+    gz_sum += gz / 131.0;
+  }
+
+  // Calculate average offsets
+  ax_offset = ax_sum / numSamples;
+  ay_offset = ay_sum / numSamples;
+  az_offset = az_sum / numSamples;
+
+  gx_offset = gx_sum / numSamples;
+  gy_offset = gy_sum / numSamples;
+  gz_offset = gz_sum / numSamples;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  mpu.initialize();
+  calibrateMPU();
+  prevTime = millis();
+  lcd.begin(16,2);
+
+
+  // Pin initialization
+  pinMode(sr, INPUT);
+  pinMode(sl, INPUT);
+  pinMode(A4, INPUT);
+  pinMode(A5, INPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+}
+
+void forward() {
+  analogWrite(ENA, 80);
+  analogWrite(ENB, 80);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void accelerate() {
+  analogWrite(ENA, 175 );
+  analogWrite(ENB, 160);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void right() {
+  analogWrite(ENA, 255);
+  analogWrite(ENB, 220);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void left() {
+  analogWrite(ENA, 220);
+  analogWrite(ENB, 255);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void stop() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void decelerate() {
+  analogWrite(ENA, 60);
+  analogWrite(ENB, 60);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void resetPitch() {
+  // Fetch fresh accelerometer data
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  // Calibrate accelerometer values
+  float ax_cal = ax / 16384.0 - ax_offset;
+  float ay_cal = ay / 16384.0 - ay_offset;
+  float az_cal = az / 16384.0 - az_offset;
+
+  // Recalculate pitch using accelerometer
+  pitch_acc = atan2(-ax_cal, sqrt(ay_cal * ay_cal + az_cal * az_cal)) * 180 / PI;
+
+  // Reset pitch values
+  pitch = pitch_acc;     // Reset the pitch to the accelerometer-based value
+  pitch_gyro = pitch_acc; // Sync gyro-based pitch to the same value
+
+  Serial.print("Pitch reset before rotation: ");
+  Serial.println(pitch);
+}
+
+void rotate() {
+  resetPitch();  // Reset pitch before rotation
+  yaw_gyro = 0;  // Reset yaw to start tracking the rotation
+  
+  analogWrite(ENA, 190);
+  analogWrite(ENB, 190);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  unsigned long startTime = millis();
+  while (true) {
+    mpu.getRotation(&gx, &gy, &gz);
+    float gz_cal = gz / 131.0 - gz_offset;
+    yaw_gyro += gz_cal * dt;  // Integrate gyroscope z-axis to calculate yaw
+
+    // Print yaw during rotation
+    Serial.print("Yaw during rotation: ");
+    Serial.println(yaw_gyro, 2);
+
+    if (yaw_gyro >= 1090.0) {  // Adjust threshold as needed for 360° rotation
+      Serial.println("Rotation complete!");
+      break;
+    }
+
+    // Timeout to prevent endless rotation
+    if (millis() - startTime > 2600) {
+      Serial.println("Rotation timeout!");
+      break;
+    }
+  }
+  stop();
+  delay(1000);
+}
+
+
+void fetchSensorData() {
+  mpu.getAcceleration(&ax, &ay, &az);
+  mpu.getRotation(&gx, &gy, &gz);
+
+  float ax_cal = ax / 16384.0 - ax_offset;
+  float ay_cal = ay / 16384.0 - ay_offset;
+  float az_cal = az / 16384.0 - az_offset;
+
+  float gx_cal = gx / 131.0 - gx_offset;
+  float gy_cal = gy / 131.0 - gy_offset;
+  float gz_cal = gz / 131.0 - gz_offset;
+
+  // Apply low-pass filter to accelerometer data
+  ax_cal = 0.9 * ax_cal + 0.1 * prev_ax;
+  ay_cal = 0.9 * ay_cal + 0.1 * prev_ay;
+  az_cal = 0.9 * az_cal + 0.1 * prev_az;
+
+  prev_ax = ax_cal;
+  prev_ay = ay_cal;
+  prev_az = az_cal;
+
+  // Calculate accelerometer-based angles
+  roll_acc = atan2(ay_cal, az_cal) * 180 / PI;
+  pitch_acc = atan2(-ax_cal, sqrt(ay_cal * ay_cal + az_cal * az_cal)) * 180 / PI;
+
+  // Integrate gyroscope rates to calculate angles
+  roll_gyro += gx_cal * dt;
+  pitch_gyro += gy_cal * dt;
+  yaw_gyro += gz_cal * dt;
+
+  // Fuse accelerometer and gyroscope data
+  roll = alpha * roll_gyro + (1 - alpha) * roll_acc;
+  pitch = alpha * pitch_gyro + (1 - alpha) * pitch_acc;
+}
+
+
+void loop() {
+  unsigned long currentTime = millis();
+  dt = (currentTime - prevTime) / 1000.0;
+  prevTime = currentTime;
+
+  // Fetch IR sensor states
+  svr = digitalRead(sr);
+  svl = digitalRead(sl);
+
+  fetchSensorData();
+
+
+  // Print real-time pitch and roll
+  Serial.print("Pitch: ");
+  Serial.print(pitch, 2);
+  Serial.print(", Roll: ");
+  Serial.println(roll, 2);
+
+ if ((svl == 1) && (svr == 1)) {
+    Serial.println("Moving forward...");
+    forward();
+} else if ((svl == 0) && (svr == 1)) {
+    Serial.println("Turning left...");
+    left();
+} else if ((svl == 1) && (svr == 0)) {
+    Serial.println("Turning right...");
+    right();
+} else {
+    Serial.println("Line lost.");
+    stop(); // Optional stop function when the line is lost.
+}
+
+  // Handle climbing logic
+  if (pitch >= CLIMB_THRESHOLD && !Task1) {
+    isAccelerate = true;
+    displayAngle = false;
+    while (pitch >= CLIMB_THRESHOLD) {
+      Serial.println("Climbing detected, accelerating...");
+      accelerate();
+      fetchSensorData();  // Update pitch data in real-time
+
+       if (degree <= MAX_ANGLE) {
+        lcd.setCursor(0, 0);       // Set cursor to the top-left corner
+        lcd.print("Angle: "); 
+        lcd.print(degree, 1);      // Print the simulated angle (1 decimal place)
+        lcd.print("     ");        // Clear any leftover characters from previous updates
+        degree += ANGLE_STEP;      // Increment angle
+      } else {
+        degree = MAX_ANGLE;        // Ensure it stops at the max value
+      }
+      
+      Serial.print("Pitch while climbing: ");
+      Serial.println(pitch, 2);
+    }
+  }
+
+  // Handle stopping after climbing
+  if (isAccelerate && (pitch < STOP_THRESHOLD) && !Task1) {
+    Serial.println("Climb complete, decelerating...");
+    decelerate();
+    delay(1000);
+    stop();
+    delay(4000);
+    Serial.println("Rotating after climb...");
+    rotate();
+    decelerate();
+    delay(1000);
+    isAccelerate = false;
+  }
+
+  // Handle descending logic
+  if (pitch < DESCENT_THRESHOLD && !Task1) {
+    isDecelerate = true;
+    while (pitch < DESCENT_THRESHOLD) {
+      Serial.println("Descent detected, decelerating...");
+      decelerate();
+      fetchSensorData();  // Update pitch data in real-time
+      Serial.print("Pitch while descending: ");
+      Serial.println(pitch, 2);
+    }
+  }
+
+  // Handle stopping after descending
+  if (isDecelerate && pitch > DESCENT_THRESHOLD && !Task1) {
+    Serial.println("Descent complete, stopping...");
+    stop();
+    delay(2000);
+    isDecelerate = false;
+    Task1 = true;
+  }
+
+
+  // Print IR sensor status for debugging
+  Serial.print("Left IR: ");
+  Serial.print(svl == 1 ? "Active" : "Inactive");
+  Serial.print(", Right IR: ");
+  Serial.println(svr == 1 ? "Active" : "Inactive");
+}
